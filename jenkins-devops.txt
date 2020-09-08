@@ -1,0 +1,129 @@
+def COMMIT_HASH
+node {
+    stage('Checkout Source Code') {
+        scmVars =  checkout([$class: 'GitSCM', branches: [[name: '*/dev']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '210c9e47-c56d-4b7d-9977-c290290cd8b9', url: 'https://myuser@bitbucket.company.com/scm/devops/apisourcecode.git']]])
+
+        this.COMMIT_HASH = scmVars.GIT_COMMIT
+        this.notifyBitbucket('INPROGRES')
+    }
+
+    //Run Unit testing 
+    stage('Unit Tests') {
+        
+        bat "if not exist \"CodeCoverage\" mkdir CodeCoverage"
+        bat "if not exist \"CodeCoverageHTMLReport\" mkdir CodeCoverageHTMLReport"
+        bat "if not exist \"TestResult\" mkdir TestResult"
+        
+        def MSTest = tool 'MSTest 12'
+
+        Printing = bat returnStatus: true, script: "C:/opencover/OpenCover.Console.exe -returntargetcode -register:user -target:${MSTest}  -targetargs:\"/nologo /testcontainer:SampleUnitTestProject/bin/Debug/SampleUnitTestProject.dll /resultsfile:\\\"%WORKSPACE%\\TestResult\\TestResults_Printing_${BUILD_NUMBER}.trx\\\"\" -mergebyhash -output:\"%WORKSPACE%\\CodeCoverage\\Printing_CodeCoverage.xml\""
+
+        //bat "C:/opencover/OpenCover.Console.exe -register:user -target:${MSTest} -targetargs:\"/nologo /testcontainer:GalaxyTestProject/bin/Debug/GalaxyTestProject.dll /resultsfile:\\\"%WORKSPACE%\\TestResult\\TestResults_Printing_${BUILD_NUMBER}.trx\\\"\" -mergebyhash -output:\"%WORKSPACE%\\CodeCoverage\\Printing_CodeCoverage.xml\""
+
+
+        step([$class: 'MSTestPublisher', testResultsFile:"**/*.trx", failOnError: true, keepLongStdio: true])
+
+        bat "C:/ReportGenerator_4.6.1/net47/ReportGenerator.exe \"-reports:%WORKSPACE%\\CodeCoverage\\*.xml\" \"-targetdir:%WORKSPACE%\\CodeCoverageHTMLReport\" "
+
+        publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: true, reportDir: "CodeCoverageHTMLReport", reportFiles: 'index.htm', reportName: "CodeCoverage"])
+
+        // stop the build if a unit test fails
+        if ( (Printing != 0)  ){
+            error("unit test failed")
+        }
+    }
+    //check for code quality, analysis, vulnerabilities, bugs
+    stage('SonarQube Analysis') {
+       withSonarQubeEnv('QAEnv') {
+          bat 'SonarScanner.MSBuild.exe begin /k:DevopsDev /v:1.0 /d:sonar.verbose=true /d:sonar.cs.opencover.reportsPaths=C:/\"Program Files (x86)\"/Jenkins/workspace/%JOB_BASE_NAME%/CodeCoverage/Printing_CodeCoverage.xml' 
+          //bat 'C:/"Program Files (x86)"/MSBuild/14.0/Bin/MSBuild.exe C:/\"Program Files (x86)\"/Jenkins/workspace/%JOB_BASE_NAME%/GalaxyWebAPI.sln /t:Rebuild'
+          bat 'C:/"Program Files (x86)"/"Microsoft Visual Studio"/2017/BuildTools/MSBuild/15.0/Bin/MSBuild.exe C:/\"Program Files (x86)\"/Jenkins/workspace/%JOB_BASE_NAME%/GalaxyWebAPI.sln /t:Rebuild'
+          bat "SonarScanner.MSBuild.exe end"
+        }
+    }
+    //If code issues found open vulnerabilities or bugs, set min percentage for quality gates pass.
+    stage("Check Quality Gate") {
+        timeout(time: 1, unit: 'HOURS') { 
+            def qg = waitForQualityGate()
+            if (qg.status != 'OK') {
+                error "Pipeline aborted due to quality gate failure: ${qg.status}"
+            } else {
+                echo "${qg.status}"      
+
+                stage('Build') {     
+
+
+                    try {
+                        // Build step                                             
+                        bat "C:\\Users\\pimappdev\\Jenkins\\Tools\\Test.bat" 
+
+                        // bat "C:/\"Program Files (x86)\"/MSBuild/14.0/Bin/MSBuild.exe C:/Windows/System32/config/systemprofile/AppData/Local/Jenkins.jenkins/workspace/Devops/GalaxyWebAPI.sln /t:Clean;Rebuild /p:Configuration=Release /property:OutDir=C:/Windows/System32/config/systemprofile/AppData/Local/Jenkins.jenkins/workspace/Devops/Temp/Publish /p:Platform=\"Any CPU\" /p:ProductVersion=1.0.0.${env.BUILD_NUMBER}"
+
+                        currentBuild.result = "SUCCESS"
+                    } catch (e) {
+                        // If there was an exception thrown, the build failed
+                        currentBuild.result = "FAILED"
+                        throw e
+                    } finally {
+                        // Success or failure, always send notifications            
+                        this.notifyBitbucket(currentBuild.result)
+                    }
+
+
+                    
+                }  
+                //Upload or stored build artifacts in online repository
+                stage('Upload Artifact') {
+                    nexusArtifactUploader artifacts: [
+                        [
+                            artifactId: "${JOB_BASE_NAME}",
+                            classifier: '', 
+                            file: 'WebIISHostAPI/obj/Debug/Package/WebIISHostAPI.zip', 
+                            type: 'zip'
+                        ]
+                    ], 
+                    credentialsId: 'a41ad681-e645-4d8e-ba01-ec2d9a8a267e', 
+                    groupId: "com.mycompany", 
+                    nexusUrl: 'localhost:8081', 
+                    nexusVersion: 'nexus3', 
+                    protocol: 'http', 
+                    repository: 'jenkinsArtifact', 
+                    version: "1.0.${env.BUILD_NUMBER}"
+                }
+                //Deploy to Windows IIS Server 
+                stage('Deploy to Dev') {
+                    def siteName = "DevWebsite"
+                    if(fileExists("C:\\inetpub\\wwwroot\\${siteName}")) {
+                        bat "C:\\Users\\pimappdev\\Jenkins\\Tools\\RunPowershell.bat ${siteName} 3002 User1 Admin@123 existingSiteYes" 
+                    } else {
+                        bat "C:\\Users\\pimappdev\\Jenkins\\Tools\\RunPowershell.bat ${siteName} 3002 User1 Admin@123 existingSiteNo"
+                    }
+                    bat 'C:/"Program Files (x86)"/IIS/"Microsoft Web Deploy V3"/msdeploy.exe -verb:sync -setParam:"IIS Web Application Name"="DevWebsite" -source:package="WebIISHostAPI/obj/Debug/Package/WebIISHostAPI.zip" -dest:auto,computerName="https://AWDEVOPSUATAPP:8172/msdeploy.axd?site=DevWebsite",username="AWDEVOPSUATAPP\\User1",password="Admin@123" -allowUntrusted=true -setParamFile="C:\\Users\\pimappdev\\Jenkins\\Tools\\setDevParameters.xml'
+
+                    //bat msdeploy -verb:sync -source:package="WebIISHostAPI.zip" -dest:auto,computerName='https://AWDEVOPSUATAPP:8172/msdeploy.axd?site=TestDev',username="AWDEVOPSUATAPP\DevUser",password="Passw0rd" -allowUntrusted=true -setParamFile="C:\Users\pimappdev\Jenkins\Tools\setParameters.xml"
+                    
+
+                    // powershell script to create new site --working
+                        //powershell script: 'C:\\"Program Files"\\IIS\\"Microsoft Web Deploy V3"\\Scripts\\SetupSiteForPublish.ps1 -siteName DevEnv -sitePhysicalPath C:\\inetpub\\wwwroot\\DevEnv -siteAppPoolName DevEnv -sitePort 3002 -deploymentUserName User1 -deploymentUserPassword Admin@123 -publishSettingSavePath C:\\profiles -publishSettingFileName DevEnv.PublishSettings'
+
+                    // powershell script to create existing site --working
+                    //powershell script: 'c:\\"Program Files"\\IIS\\"Microsoft Web Deploy V3"\\Scripts\\SetupSiteForPublish.ps1 -siteName $env:JOB_BASE_NAME -deploymentUserName User1 -publishSettingSavePath C:\\profiles -publishSettingFileName $env:JOB_BASE_NAME.PublishSettings'
+
+                } 
+
+                                                       
+            }
+        }
+    }  
+}
+
+def notifyBitbucket(String state) {
+ 
+    if('SUCCESS' == state || 'FAILED' == state) {
+    // Set result of currentBuild !Important!
+        currentBuild.result = state
+    }
+ 
+    notifyBitbucket commitSha1: '', considerUnstableAsSuccess: true, credentialsId: '210c9e47-c56d-4b7d-9977-c290290cd8b9', disableInprogressNotification: false, ignoreUnverifiedSSLPeer: true, includeBuildNumberInKey: true, prependParentProjectKey: false, projectKey: '', stashServerBaseUrl: 'https://bitbucket.companyname.com'
+ 
+}
